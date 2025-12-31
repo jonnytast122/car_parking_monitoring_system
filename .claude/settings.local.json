@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(\".venv/Scripts/pip\" list)",
+      "Bash(\".venv/Scripts/python\" car_entrance_counter.py)",
+      "Bash(timeout 5 powershell:*)",
+      "Bash(powershell -Command \"Start-Sleep -Seconds 15\")"
+    ]
+  }
+}
