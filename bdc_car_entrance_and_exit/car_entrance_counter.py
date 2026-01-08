@@ -292,16 +292,20 @@ class CarEntranceCounter:
 
         return frame
 
-    def draw_statistics(self, frame):
+    def draw_statistics(self, frame, fps=0):
         """Draw count statistics on frame"""
         # Background for statistics
         if self.enable_counting:
-            cv2.rectangle(frame, (10, 10), (350, 70), (0, 0, 0), -1)
-            cv2.rectangle(frame, (10, 10), (350, 70), (255, 255, 255), 2)
+            cv2.rectangle(frame, (10, 10), (350, 110), (0, 0, 0), -1)
+            cv2.rectangle(frame, (10, 10), (350, 110), (255, 255, 255), 2)
 
             # Display entrance count
             cv2.putText(frame, f"VEHICLES PASSED: {self.entrance_count}", (20, 45),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+            # Display FPS
+            cv2.putText(frame, f"FPS: {fps:.2f}", (20, 85),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
 
         return frame
 
@@ -319,6 +323,9 @@ class CarEntranceCounter:
 
         frame_count = 0
         start_time = time.time()
+        fps_start_time = time.time()
+        fps_frame_count = 0
+        fps_actual = 0
 
         print(f"Processing video: {self.video_path}")
         print(f"Frame size: {self.width}x{self.height}")
@@ -338,6 +345,14 @@ class CarEntranceCounter:
                 break
 
             frame_count += 1
+            fps_frame_count += 1
+
+            # Calculate FPS every second
+            fps_elapsed = time.time() - fps_start_time
+            if fps_elapsed >= 1.0:
+                fps_actual = fps_frame_count / fps_elapsed
+                fps_frame_count = 0
+                fps_start_time = time.time()
 
             # Run YOLO detection with AGGRESSIVE NMS to prevent duplicate detections
             # conf=0.3: Lower confidence to catch small/distant objects
@@ -397,7 +412,7 @@ class CarEntranceCounter:
 
             # Draw annotations
             frame = self.draw_annotations(frame, tracks)
-            frame = self.draw_statistics(frame)
+            frame = self.draw_statistics(frame, fps_actual)
 
             # Write frame
             out.write(frame)
@@ -452,7 +467,7 @@ class CarEntranceCounter:
 def main():
     # Configuration
     VIDEO_PATH = "BDC-Entrance-Cuted.mp4"
-    MODEL_PATH = "yolo12x.pt"
+    MODEL_PATH = "yolo12m.pt"
     OUTPUT_PATH = "output_entrance_count.mp4"
     COUNTING_LINE_POSITION = 0.5  # 50% of frame height
 
