@@ -3,10 +3,11 @@ import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import time
+import torch
 
 
 class CarExitCounter:
-    def __init__(self, video_path, model_path, detection_region=None, counting_line_position=0.5, enable_counting=True, show_tracking=True, temporal_threshold_minutes=0.3, spatial_threshold_pixels=150):
+    def __init__(self, video_path, model_path, detection_region=None, counting_line_position=0.7, enable_counting=True, show_tracking=True, temporal_threshold_minutes=0.3, spatial_threshold_pixels=150, process_interval=5):
         """
         Initialize the car exit counter
 
@@ -17,11 +18,48 @@ class CarExitCounter:
             counting_line_position: Position of counting line (0-1, relative to frame height)
             enable_counting: Enable vehicle counting (default: True)
             show_tracking: Show tracking boxes and IDs (default: True)
-            temporal_threshold_minutes: Time window in minutes for duplicate detection (default: 0.33 = 20 seconds)
+            temporal_threshold_minutes: Time window in minutes for duplicate detection (default: 0.3 = 18 seconds)
             spatial_threshold_pixels: Distance threshold in pixels for duplicate detection (default: 150)
+            process_interval: Process detection/counting every N frames (default: 5, set to 1 for every frame)
         """
         self.video_path = video_path
         self.model = YOLO(model_path)
+
+        # Check GPU availability and set device
+        if torch.cuda.is_available():
+            self.device = 'cuda'
+            print("=" * 60)
+            print(f"GPU DETECTED: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA Version: {torch.version.cuda}")
+            print(f"Number of GPUs: {torch.cuda.device_count()}")
+            print(f"Running on GPU")
+            print("=" * 60)
+        else:
+            self.device = 'cpu'
+            print("=" * 60)
+            print("WARNING: GPU NOT DETECTED - Running on CPU")
+            print("Possible reasons:")
+
+            # Check PyTorch CUDA support
+            if not torch.cuda.is_available():
+                if torch.version.cuda is None:
+                    print("  1. PyTorch is not compiled with CUDA support")
+                    print("     Solution: Install PyTorch with CUDA support:")
+                    print("     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130")
+                else:
+                    print("  1. CUDA is available in PyTorch but no GPU detected")
+                    print("     Possible causes:")
+                    print("     - No NVIDIA GPU hardware installed")
+                    print("     - GPU drivers not installed or outdated")
+                    print("     - CUDA toolkit version mismatch")
+                    print(f"     - PyTorch CUDA version: {torch.version.cuda}")
+                    print("     Solution: Install/update NVIDIA GPU drivers from:")
+                    print("     https://www.nvidia.com/Download/index.aspx")
+
+            print("=" * 60)
+
+        # Move model to the selected device
+        self.model.to(self.device)
 
         # Optimized DeepSORT parameters for better tracking consistency
         # VERY AGGRESSIVE settings to handle cars moving closer to camera (extreme scale/appearance changes)
@@ -30,7 +68,7 @@ class CarExitCounter:
         # max_iou_distance: Maximum distance for matching detections to tracks (HIGHER = more lenient with size changes)
         # max_cosine_distance: Cosine distance threshold for appearance features (HIGHER = more lenient with appearance changes)
         self.tracker = DeepSort(
-            max_age=30,              # MAXIMUM persistence - keep tracks alive very long
+            max_age=20,              # MAXIMUM persistence - keep tracks alive very long
             n_init=2,                 # Quick confirmation - reduces delay in ID assignment
             max_iou_distance=0.7,    # Very high leniency for size changes (small→large)
             max_cosine_distance=0.9,  # VERY high appearance tolerance - handles dramatic changes
@@ -39,6 +77,7 @@ class CarExitCounter:
 
         self.enable_counting = enable_counting
         self.show_tracking = show_tracking
+        self.process_interval = process_interval  # Process every N frames
 
         # Initialize video capture
         self.cap = cv2.VideoCapture(video_path)
@@ -66,6 +105,7 @@ class CarExitCounter:
         self.exit_count = 0
         self.track_positions = {}  # {track_id: [previous_y_positions]}
         self.inside_region = {}  # {track_id: is_inside}
+        self.track_last_counted_time = {}  # {track_id: timestamp} - prevent re-counting within cooldown period
 
         # Spatial-temporal filtering to prevent duplicate counts
         # ADJUSTABLE thresholds to handle cars moving closer to camera (extreme screen movement)
@@ -86,9 +126,9 @@ class CarExitCounter:
         return self.colors[track_id]
 
     def is_car(self, class_id):
-        """Check if detected object is a car (class 2 in COCO dataset)"""
-        # COCO classes: 2=car (only cars, no motorcycles, buses, or trucks)
-        return class_id == 2
+        """Check if detected object is a car or truck (COCO dataset)"""
+        # COCO classes: 2=car, 7=truck
+        return class_id in [2, 7]
 
     def calculate_iou(self, box1, box2):
         """
@@ -211,7 +251,8 @@ class CarExitCounter:
 
     def count_vehicle(self, track_id, center_x, center_y, current_time):
         """
-        Count vehicle when it passes through the detection region
+        Count vehicle when it passes through the detection region with direction validation
+        Only adds to count, never subtracts (no reverse detection)
 
         Args:
             track_id: Unique ID of the tracked vehicle
@@ -219,6 +260,15 @@ class CarExitCounter:
             center_y: Current Y position of vehicle center
             current_time: Current timestamp for spatial-temporal filtering
         """
+        # Initialize position history for this track if needed
+        if track_id not in self.track_positions:
+            self.track_positions[track_id] = []
+
+        # Store current Y position (keep last 10 positions for direction calculation)
+        self.track_positions[track_id].append(center_y)
+        if len(self.track_positions[track_id]) > 10:
+            self.track_positions[track_id].pop(0)
+
         # Check if vehicle is inside the detection region
         is_inside = self.is_point_in_region(center_x, center_y)
 
@@ -227,10 +277,41 @@ class CarExitCounter:
         self.inside_region[track_id] = is_inside
 
         # Count when vehicle enters the region (wasn't inside before, but is now)
-        # This counts any vehicle that passes through the polygon
-        if self.enable_counting and track_id not in self.counted_ids and is_inside and not was_inside:
-            # Count based on track_id only - rely on DeepSORT to prevent duplicates
+        if self.enable_counting and is_inside and not was_inside:
+            # Check temporal cooldown: has enough time passed since last count?
+            COOLDOWN_SECONDS = 25.0  # Don't re-count same ID within 20 seconds
+            last_counted_time = self.track_last_counted_time.get(track_id, -float('inf'))
+            time_since_last_count = current_time - last_counted_time
+
+            if time_since_last_count < COOLDOWN_SECONDS:
+                # Too soon - likely a reverse/re-exit, skip counting
+                return False
+
+            # Verify direction: car should be moving UPWARD (exiting) not DOWNWARD (entering)
+            # Need at least 3 position samples to determine direction
+            if len(self.track_positions[track_id]) >= 3:
+                # Calculate direction from position history
+                # Negative movement = moving up (exiting), Positive = moving down (entering)
+                recent_positions = self.track_positions[track_id][-5:]  # Last 5 positions
+
+                # Calculate average movement direction
+                movements = []
+                for i in range(1, len(recent_positions)):
+                    movements.append(recent_positions[i] - recent_positions[i-1])
+
+                avg_movement = sum(movements) / len(movements) if movements else 0
+
+                # EXIT DIRECTION: Y should be DECREASING (moving up in frame = exiting)
+                # If average movement is positive or too small, car is entering/stationary
+                MIN_MOVEMENT_THRESHOLD = -2.0  # pixels per frame (negative = upward)
+
+                if avg_movement > MIN_MOVEMENT_THRESHOLD:
+                    # Car is entering or not moving properly - don't count as exit
+                    return False
+
+            # All checks passed - count the vehicle exit
             self.counted_ids.add(track_id)
+            self.track_last_counted_time[track_id] = current_time
             self.exit_count += 1
             return True
 
@@ -326,12 +407,14 @@ class CarExitCounter:
         fps_start_time = time.time()
         fps_frame_count = 0
         fps_actual = 0
+        last_tracks = []  # Keep last known tracks for smooth display
 
         print(f"Processing video: {self.video_path}")
         print(f"Frame size: {self.width}x{self.height}")
         print(f"FPS: {self.fps}")
         if self.detection_region:
             print(f"Detection region: {len(self.detection_region)} points defined")
+        print(f"Process interval: Every {self.process_interval} frame(s)")
         print("-" * 50)
 
         while self.cap.isOpened():
@@ -349,16 +432,41 @@ class CarExitCounter:
                 fps_frame_count = 0
                 fps_start_time = time.time()
 
-            # Run YOLO detection with strict confidence to prevent false detections
-            # conf=0.5: Moderate-high confidence to only detect real cars, prevent hallucinations
+            # Process detection/counting only every N frames (skip frames for performance)
+            if frame_count % self.process_interval != 0:
+                # Skip detection but still draw last known tracks and statistics for smooth display
+                frame = self.draw_annotations(frame, last_tracks)
+                frame = self.draw_statistics(frame, fps_actual)
+
+                # Write frame with annotations
+                out.write(frame)
+
+                # Display
+                if display:
+                    cv2.imshow('Car Exit Counter', frame)
+
+                # Check for key press
+                if display:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        print("Stopped by user")
+                        break
+                    elif key == ord('p'):
+                        print("Paused. Press any key to continue...")
+                        cv2.waitKey(0)
+
+                continue
+
+            # Run YOLO detection with lower confidence to detect more cars
+            # conf=0.25: Lower confidence to catch more cars that might be missed
             # iou=0.5: Moderate IoU for NMS - balanced suppression
-            # imgsz=640: Image size for detection (larger = better for small objects, but slower)
+            # imgsz=1280: Larger image size for better detection of small/distant objects
             # agnostic_nms=True: Apply NMS across all classes
-            results = self.model(frame, conf=0.8, iou=0.5, imgsz=640, agnostic_nms=True, verbose=False)[0]
+            results = self.model(frame, conf=0.35, iou=0.5, imgsz=640, agnostic_nms=True, verbose=False, device=self.device)[0]
 
             # Prepare detections for DeepSORT with confidence filtering
             detections = []
-            MIN_CONFIDENCE = 0.8  # Match detection confidence - prevents hallucinations and false detections
+            MIN_CONFIDENCE = 0.35  # Lower threshold to detect more cars that might be missed
 
             for box in results.boxes:
                 class_id = int(box.cls[0])
@@ -387,6 +495,9 @@ class CarExitCounter:
             # Update tracker
             tracks = self.tracker.update_tracks(detections, frame=frame)
 
+            # Save tracks for drawing on skipped frames (prevents flashing)
+            last_tracks = tracks
+
             # Count vehicles
             for track in tracks:
                 if not track.is_confirmed():
@@ -400,11 +511,11 @@ class CarExitCounter:
                 center_x = (x1 + x2) // 2
                 center_y = (y1 + y2) // 2
 
-                # Check and count (with current time for spatial-temporal filtering)
+                # Check and count (with direction validation and temporal filtering)
                 current_time = time.time() - start_time
                 if self.count_vehicle(track_id, center_x, center_y, current_time):
-                    print(f"[COUNT] Frame {frame_count}: Car ID {track_id} passed through exit zone! Total count: {self.exit_count}")
-                    print(f"        Already counted IDs: {sorted(self.counted_ids)}")
+                    print(f"[+COUNT] Frame {frame_count}: Car ID {track_id} EXITED (moving upward)! Total: {self.exit_count}")
+                    print(f"         Counted IDs: {sorted(self.counted_ids)}")
 
             # Draw annotations
             frame = self.draw_annotations(frame, tracks)
@@ -462,19 +573,22 @@ def main():
     VIDEO_PATH = "BDC-exit-Cuted.mp4"
     MODEL_PATH = "yolo12m.pt"
     OUTPUT_PATH = "output_exit_count.mp4"
-    COUNTING_LINE_POSITION = 0.5  # 50% of frame height
+    COUNTING_LINE_POSITION = 0.6  # 50% of frame height
 
     # Detection region polygon for exit (detection area - NOT counting line)
     DETECTION_REGION = [
-        (39, 574),
-        (38, 282),
-        (723, 281),
-        (725, 575)
+        (0, 575),
+        (0, 282),
+        (765, 282),
+        (765, 575)
     ]
 
     # Duplicate prevention settings (ADJUSTABLE)
-    TEMPORAL_THRESHOLD_MINUTES = 1.0   # Time window: 1.0 min = 60 seconds (catch ID switches)
+    TEMPORAL_THRESHOLD_MINUTES = 2.0   # Time window: 1.0 min = 60 seconds (catch ID switches)
     SPATIAL_THRESHOLD_PIXELS = 300     # Distance threshold: 300 pixels (large area to catch same car)
+
+    # Performance settings
+    PROCESS_INTERVAL = 5  # Process detection/counting every frame for better detection (1 = every frame, 5 = every 5th frame)
 
     # Create counter with tracking visualization
     counter = CarExitCounter(
@@ -485,7 +599,8 @@ def main():
         enable_counting=True,                              # Enable counting
         show_tracking=True,                                # Show tracking boxes and IDs
         temporal_threshold_minutes=TEMPORAL_THRESHOLD_MINUTES,  # Adjustable time window
-        spatial_threshold_pixels=SPATIAL_THRESHOLD_PIXELS       # Adjustable spatial distance
+        spatial_threshold_pixels=SPATIAL_THRESHOLD_PIXELS,      # Adjustable spatial distance
+        process_interval=PROCESS_INTERVAL                       # Process every N frames for performance
     )
 
     # Process video
