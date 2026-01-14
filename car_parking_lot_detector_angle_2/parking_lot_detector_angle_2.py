@@ -3,6 +3,7 @@ import numpy as np
 import json
 from ultralytics import YOLO
 import time
+import torch
 
 
 class ParkingLotDetector:
@@ -28,6 +29,42 @@ class ParkingLotDetector:
         """
         self.image_path = image_path
         self.model = YOLO(model_path)
+
+        # Check GPU availability and set device
+        if torch.cuda.is_available():
+            self.device = 'cuda'
+            print("=" * 60)
+            print(f"GPU DETECTED: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA Version: {torch.version.cuda}")
+            print(f"Number of GPUs: {torch.cuda.device_count()}")
+            print(f"Running on GPU")
+            print("=" * 60)
+        else:
+            self.device = 'cpu'
+            print("=" * 60)
+            print("WARNING: GPU NOT DETECTED - Running on CPU")
+            print("Possible reasons:")
+
+            # Check PyTorch CUDA support
+            if not torch.cuda.is_available():
+                if torch.version.cuda is None:
+                    print("  1. PyTorch is not compiled with CUDA support")
+                    print("     Solution: Install PyTorch with CUDA support:")
+                    print("     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130")
+                else:
+                    print("  1. CUDA is available in PyTorch but no GPU detected")
+                    print("     Possible causes:")
+                    print("     - No NVIDIA GPU hardware installed")
+                    print("     - GPU drivers not installed or outdated")
+                    print("     - CUDA toolkit version mismatch")
+                    print(f"     - PyTorch CUDA version: {torch.version.cuda}")
+                    print("     Solution: Install/update NVIDIA GPU drivers from:")
+                    print("     https://www.nvidia.com/Download/index.aspx")
+
+            print("=" * 60)
+
+        # Move model to the selected device
+        self.model.to(self.device)
 
         # YOLO detection parameters
         self.conf_threshold = conf_threshold
@@ -263,7 +300,8 @@ class ParkingLotDetector:
             iou=self.iou_threshold,
             imgsz=self.imgsz,
             agnostic_nms=True,
-            verbose=False
+            verbose=False,
+            device=self.device
         )[0]
 
         # Collect car detections
