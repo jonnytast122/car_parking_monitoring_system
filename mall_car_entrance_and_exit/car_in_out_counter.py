@@ -3,6 +3,7 @@ import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import time
+import torch
 
 
 class CarInOutCounter:
@@ -21,6 +22,42 @@ class CarInOutCounter:
         """
         self.video_path = video_path
         self.model = YOLO(model_path)
+
+        # Check GPU availability and set device
+        if torch.cuda.is_available():
+            self.device = 'cuda'
+            print("=" * 60)
+            print(f"GPU DETECTED: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA Version: {torch.version.cuda}")
+            print(f"Number of GPUs: {torch.cuda.device_count()}")
+            print(f"Running on GPU")
+            print("=" * 60)
+        else:
+            self.device = 'cpu'
+            print("=" * 60)
+            print("WARNING: GPU NOT DETECTED - Running on CPU")
+            print("Possible reasons:")
+
+            # Check PyTorch CUDA support
+            if not torch.cuda.is_available():
+                if torch.version.cuda is None:
+                    print("  1. PyTorch is not compiled with CUDA support")
+                    print("     Solution: Install PyTorch with CUDA support:")
+                    print("     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130")
+                else:
+                    print("  1. CUDA is available in PyTorch but no GPU detected")
+                    print("     Possible causes:")
+                    print("     - No NVIDIA GPU hardware installed")
+                    print("     - GPU drivers not installed or outdated")
+                    print("     - CUDA toolkit version mismatch")
+                    print(f"     - PyTorch CUDA version: {torch.version.cuda}")
+                    print("     Solution: Install/update NVIDIA GPU drivers from:")
+                    print("     https://www.nvidia.com/Download/index.aspx")
+
+            print("=" * 60)
+
+        # Move model to the selected device
+        self.model.to(self.device)
 
         # Optimized DeepSORT parameters to prevent ID switches and duplicate counting
         # Especially important for stationary vehicles that may stop and start again
@@ -353,7 +390,7 @@ class CarInOutCounter:
             # Run YOLO detection with aggressive NMS to prevent duplicate detections
             # conf=0.6: High confidence for reliable detections
             # iou=0.3: Aggressive NMS - removes overlapping boxes more strictly (IMPORTANT for stationary cars)
-            results = self.model(frame, conf=0.8, iou=0.3, imgsz=640, agnostic_nms=True, verbose=False)[0]
+            results = self.model(frame, conf=0.8, iou=0.3, imgsz=640, agnostic_nms=True, verbose=False, device=self.device)[0]
 
             # Prepare detections for DeepSORT
             detections = []
@@ -485,7 +522,7 @@ class CarInOutCounter:
 
 def main():
     # Configuration
-    VIDEO_PATH = "video/20251223172447350.MP4"  # Change to your video path
+    VIDEO_PATH = "20251223172447350.MP4"  # Change to your video path
     MODEL_PATH = "yolo12x.pt"
     OUTPUT_PATH = "output_in_out_count.mp4"
 
