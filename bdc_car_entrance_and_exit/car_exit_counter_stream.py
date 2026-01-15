@@ -681,8 +681,8 @@ def main():
     DETECTION_REGION = [
         (0, 575),
         (0, 282),
-        (765, 282),
-        (765, 575)
+        (704, 282),
+        (704, 575)
     ]
 
     # Duplicate prevention settings (ADJUSTABLE)
