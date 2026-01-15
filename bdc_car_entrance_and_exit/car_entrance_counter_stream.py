@@ -3,10 +3,11 @@ import numpy as np
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import time
+import torch
 
 
 class CarEntranceCounterStream:
-    def __init__(self, stream_url, model_path, detection_region=None, counting_line_position=0.5, enable_counting=True, show_tracking=True, temporal_threshold_minutes=0.33, spatial_threshold_pixels=150):
+    def __init__(self, stream_url, model_path, detection_region=None, counting_line_position=0.5, enable_counting=True, show_tracking=True, temporal_threshold_minutes=0.33, spatial_threshold_pixels=150, process_interval=5):
         """
         Initialize the car entrance counter for RTSP stream
 
@@ -19,9 +20,46 @@ class CarEntranceCounterStream:
             show_tracking: Show tracking boxes and IDs (default: True)
             temporal_threshold_minutes: Time window in minutes for duplicate detection (default: 0.33 = 20 seconds)
             spatial_threshold_pixels: Distance threshold in pixels for duplicate detection (default: 150)
+            process_interval: Process detection/counting every N frames (default: 5, set to 1 for every frame)
         """
         self.stream_url = stream_url
         self.model = YOLO(model_path)
+
+        # Check GPU availability and set device
+        if torch.cuda.is_available():
+            self.device = 'cuda'
+            print("=" * 60)
+            print(f"GPU DETECTED: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA Version: {torch.version.cuda}")
+            print(f"Number of GPUs: {torch.cuda.device_count()}")
+            print(f"Running on GPU")
+            print("=" * 60)
+        else:
+            self.device = 'cpu'
+            print("=" * 60)
+            print("WARNING: GPU NOT DETECTED - Running on CPU")
+            print("Possible reasons:")
+
+            # Check PyTorch CUDA support
+            if not torch.cuda.is_available():
+                if torch.version.cuda is None:
+                    print("  1. PyTorch is not compiled with CUDA support")
+                    print("     Solution: Install PyTorch with CUDA support:")
+                    print("     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130")
+                else:
+                    print("  1. CUDA is available in PyTorch but no GPU detected")
+                    print("     Possible causes:")
+                    print("     - No NVIDIA GPU hardware installed")
+                    print("     - GPU drivers not installed or outdated")
+                    print("     - CUDA toolkit version mismatch")
+                    print(f"     - PyTorch CUDA version: {torch.version.cuda}")
+                    print("     Solution: Install/update NVIDIA GPU drivers from:")
+                    print("     https://www.nvidia.com/Download/index.aspx")
+
+            print("=" * 60)
+
+        # Move model to the selected device
+        self.model.to(self.device)
 
         # Optimized DeepSORT parameters for better tracking consistency
         # VERY AGGRESSIVE settings to handle cars moving closer to camera (extreme scale/appearance changes)
@@ -30,7 +68,7 @@ class CarEntranceCounterStream:
         # max_iou_distance: Maximum distance for matching detections to tracks (HIGHER = more lenient with size changes)
         # max_cosine_distance: Cosine distance threshold for appearance features (HIGHER = more lenient with appearance changes)
         self.tracker = DeepSort(
-            max_age=60,               # Keep tracks alive even longer - prevents losing track during brief occlusions
+            max_age=20,               # Keep tracks alive even longer - prevents losing track during brief occlusions
             n_init=2,                 # Confirm tracks faster (2-3 frames) - prevents delayed ID assignment
             max_iou_distance=0.95,    # Almost ignore IOU - very lenient with size changes (small→large)
             max_cosine_distance=0.9,  # VERY lenient appearance matching - critical for dramatic perspective changes
@@ -39,6 +77,7 @@ class CarEntranceCounterStream:
 
         self.enable_counting = enable_counting
         self.show_tracking = show_tracking
+        self.process_interval = process_interval  # Process every N frames
 
         # Initialize video capture with RTSP options
         self.cap = None
@@ -68,6 +107,7 @@ class CarEntranceCounterStream:
         self.entrance_count = 0
         self.track_positions = {}  # {track_id: [previous_y_positions]}
         self.inside_region = {}  # {track_id: is_inside}
+        self.track_last_counted_time = {}  # {track_id: timestamp} - prevent re-counting within cooldown period
 
         # Spatial-temporal filtering to prevent duplicate counts
         # ADJUSTABLE thresholds to handle cars moving closer to camera (extreme screen movement)
@@ -264,7 +304,8 @@ class CarEntranceCounterStream:
 
     def count_vehicle(self, track_id, center_x, center_y, current_time):
         """
-        Count vehicle when it passes through the detection region
+        Count vehicle when it passes through the detection region with direction validation
+        Also handles reverse exits (decrements count when car backs out)
 
         Args:
             track_id: Unique ID of the tracked vehicle
@@ -272,6 +313,15 @@ class CarEntranceCounterStream:
             center_y: Current Y position of vehicle center
             current_time: Current timestamp for spatial-temporal filtering
         """
+        # Initialize position history for this track if needed
+        if track_id not in self.track_positions:
+            self.track_positions[track_id] = []
+
+        # Store current Y position (keep last 10 positions for direction calculation)
+        self.track_positions[track_id].append(center_y)
+        if len(self.track_positions[track_id]) > 10:
+            self.track_positions[track_id].pop(0)
+
         # Check if vehicle is inside the detection region
         is_inside = self.is_point_in_region(center_x, center_y)
 
@@ -279,11 +329,65 @@ class CarEntranceCounterStream:
         was_inside = self.inside_region.get(track_id, False)
         self.inside_region[track_id] = is_inside
 
+        # REVERSE EXIT DETECTION: Vehicle was inside, now outside, and was previously counted
+        if self.enable_counting and not is_inside and was_inside and track_id in self.counted_ids:
+            # Check if car is moving UPWARD (reversing out)
+            if len(self.track_positions[track_id]) >= 3:
+                recent_positions = self.track_positions[track_id][-5:]
+                movements = []
+                for i in range(1, len(recent_positions)):
+                    movements.append(recent_positions[i] - recent_positions[i-1])
+
+                avg_movement = sum(movements) / len(movements) if movements else 0
+
+                # REVERSE DIRECTION: Y should be DECREASING (moving up = reversing)
+                MIN_REVERSE_THRESHOLD = -2.0  # Negative movement = going backwards
+
+                if avg_movement < MIN_REVERSE_THRESHOLD:
+                    # Car is reversing out - UNCOUNT it
+                    self.counted_ids.remove(track_id)
+                    self.entrance_count -= 1
+                    # Clear the last counted time so it can be counted again if it re-enters
+                    if track_id in self.track_last_counted_time:
+                        del self.track_last_counted_time[track_id]
+                    return "reversed"  # Special return value to indicate reverse exit
+
         # Count when vehicle enters the region (wasn't inside before, but is now)
-        # This counts any vehicle that passes through the polygon
-        if self.enable_counting and track_id not in self.counted_ids and is_inside and not was_inside:
-            # Count every car that passes through the region (no duplicate filtering)
+        if self.enable_counting and is_inside and not was_inside:
+            # Check temporal cooldown: has enough time passed since last count?
+            COOLDOWN_SECONDS = 30.0  # Don't re-count same ID within 30 seconds
+            last_counted_time = self.track_last_counted_time.get(track_id, -float('inf'))
+            time_since_last_count = current_time - last_counted_time
+
+            if time_since_last_count < COOLDOWN_SECONDS:
+                # Too soon - likely a reverse/re-entry, skip counting
+                return False
+
+            # Verify direction: car should be moving DOWNWARD (entering) not UPWARD (reversing)
+            # Need at least 3 position samples to determine direction
+            if len(self.track_positions[track_id]) >= 3:
+                # Calculate direction from position history
+                # Positive movement = moving down (entering), Negative = moving up (reversing)
+                recent_positions = self.track_positions[track_id][-5:]  # Last 5 positions
+
+                # Calculate average movement direction
+                movements = []
+                for i in range(1, len(recent_positions)):
+                    movements.append(recent_positions[i] - recent_positions[i-1])
+
+                avg_movement = sum(movements) / len(movements) if movements else 0
+
+                # ENTRANCE DIRECTION: Y should be INCREASING (moving down in frame)
+                # If average movement is negative or too small, car is reversing/stationary
+                MIN_MOVEMENT_THRESHOLD = 2.0  # pixels per frame - adjust based on your video
+
+                if avg_movement < MIN_MOVEMENT_THRESHOLD:
+                    # Car is reversing or not moving forward - don't count
+                    return False
+
+            # All checks passed - count the vehicle
             self.counted_ids.add(track_id)
+            self.track_last_counted_time[track_id] = current_time
             self.entrance_count += 1
             return True
 
@@ -385,12 +489,14 @@ class CarEntranceCounterStream:
         fps_actual = 0
         consecutive_failures = 0
         max_failures = 30  # Reconnect after 30 consecutive failed reads
+        last_tracks = []  # Keep last known tracks for smooth display
 
         print(f"Processing stream: {self.stream_url}")
         print(f"Frame size: {self.width}x{self.height}")
         print(f"FPS: {self.fps}")
         if self.detection_region:
             print(f"Detection region: {len(self.detection_region)} points defined")
+        print(f"Process interval: Every {self.process_interval} frame(s)")
         print("-" * 50)
         print("Press 'q' to quit, 'p' to pause")
         print("-" * 50)
@@ -439,6 +545,37 @@ class CarEntranceCounterStream:
                 fps_frame_count = 0
                 fps_start_time = time.time()
 
+            # Process detection/counting only every N frames (skip frames for performance)
+            if frame_count % self.process_interval != 0:
+                # Skip detection but still draw last known tracks and statistics for smooth display
+                frame = self.draw_annotations(frame, last_tracks)
+                frame = self.draw_statistics(frame, fps_actual)
+
+                # Write frame with annotations
+                if save_output and out is not None:
+                    out.write(frame)
+
+                # Display - only update every 3rd frame to prevent freezing
+                if display and frame_count % 3 == 0:
+                    display_frame = frame.copy()
+                    if self.width > 1280:
+                        scale = 1280 / self.width
+                        new_width = 1280
+                        new_height = int(self.height * scale)
+                        display_frame = cv2.resize(display_frame, (new_width, new_height))
+                    cv2.imshow('Car Entrance Counter - LIVE', display_frame)
+
+                if display:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        print("Stopped by user")
+                        break
+                    elif key == ord('p'):
+                        print("Paused. Press any key to continue...")
+                        cv2.waitKey(0)
+
+                continue
+
             # Wrap processing in try-except to handle corrupted frames
             try:
                 # Run YOLO detection with AGGRESSIVE NMS to prevent duplicate detections
@@ -446,7 +583,7 @@ class CarEntranceCounterStream:
                 # iou=0.7: HIGHER IoU for NMS - more aggressive suppression of overlapping boxes
                 # imgsz=640: Image size for detection (larger = better for small objects, but slower)
                 # agnostic_nms=True: Apply NMS across all classes
-                results = self.model(frame, conf=0.3, iou=0.7, imgsz=640, agnostic_nms=True, verbose=False)[0]
+                results = self.model(frame, conf=0.3, iou=0.7, imgsz=640, agnostic_nms=True, verbose=False, device=self.device)[0]
             except Exception as e:
                 # Skip corrupted frames that cause detection errors
                 print(f"Error processing frame {frame_count}: {e}")
@@ -454,7 +591,7 @@ class CarEntranceCounterStream:
 
             # Prepare detections for DeepSORT with confidence filtering
             detections = []
-            MIN_CONFIDENCE = 0.5  # Higher minimum confidence to reduce false detections (was 0.4)
+            MIN_CONFIDENCE = 0.3  # Higher minimum confidence to reduce false detections (was 0.4)
 
             for box in results.boxes:
                 class_id = int(box.cls[0])
@@ -482,6 +619,9 @@ class CarEntranceCounterStream:
             # Update tracker
             tracks = self.tracker.update_tracks(detections, frame=frame)
 
+            # Save tracks for drawing on skipped frames (prevents flashing)
+            last_tracks = tracks
+
             # Count vehicles
             for track in tracks:
                 if not track.is_confirmed():
@@ -495,11 +635,15 @@ class CarEntranceCounterStream:
                 center_x = (x1 + x2) // 2
                 center_y = (y1 + y2) // 2
 
-                # Check and count (with current time for spatial-temporal filtering)
+                # Check and count (with direction validation and temporal filtering)
                 current_time = time.time() - start_time
-                if self.count_vehicle(track_id, center_x, center_y, current_time):
-                    print(f"[COUNT] Frame {frame_count}: Car ID {track_id} passed through detection zone! Total count: {self.entrance_count}")
-                    print(f"        Already counted IDs: {sorted(self.counted_ids)}")
+                result = self.count_vehicle(track_id, center_x, center_y, current_time)
+                if result == True:
+                    print(f"[+COUNT] Frame {frame_count}: Car ID {track_id} ENTERED (moving forward)! Total: {self.entrance_count}")
+                    print(f"         Counted IDs: {sorted(self.counted_ids)}")
+                elif result == "reversed":
+                    print(f"[-COUNT] Frame {frame_count}: Car ID {track_id} REVERSED OUT (backing up)! Total: {self.entrance_count}")
+                    print(f"         Counted IDs: {sorted(self.counted_ids)}")
 
             # Draw annotations
             frame = self.draw_annotations(frame, tracks)
@@ -531,10 +675,11 @@ class CarEntranceCounterStream:
                     print("Paused. Press any key to continue...")
                     cv2.waitKey(0)
 
-            # Print progress every 100 frames
-            if frame_count % 100 == 0:
+            # Print progress every 30 frames
+            if frame_count % 30 == 0:
                 elapsed = time.time() - start_time
-                print(f"Processed {frame_count} frames | FPS: {fps_actual:.2f} | Count: {self.entrance_count} | Elapsed: {elapsed:.1f}s")
+                fps_actual = frame_count / elapsed
+                print(f"Processed {frame_count} frames | FPS: {fps_actual:.2f} | Count: {self.entrance_count}")
 
         # Cleanup
         self.cap.release()
@@ -575,6 +720,9 @@ def main():
     TEMPORAL_THRESHOLD_MINUTES = 0.33  # Time window: 0.33 min = 20 seconds (adjust as needed)
     SPATIAL_THRESHOLD_PIXELS = 150     # Distance threshold in pixels (adjust as needed)
 
+    # Performance settings
+    PROCESS_INTERVAL = 10  # Process detection/counting every 5 frames (1 = every frame, 5 = every 5th frame)
+
     # Create counter with tracking visualization
     counter = CarEntranceCounterStream(
         stream_url=STREAM_URL,
@@ -584,7 +732,8 @@ def main():
         enable_counting=True,                              # Enable counting
         show_tracking=True,                                # Show tracking boxes and IDs
         temporal_threshold_minutes=TEMPORAL_THRESHOLD_MINUTES,  # Adjustable time window
-        spatial_threshold_pixels=SPATIAL_THRESHOLD_PIXELS       # Adjustable spatial distance
+        spatial_threshold_pixels=SPATIAL_THRESHOLD_PIXELS,      # Adjustable spatial distance
+        process_interval=PROCESS_INTERVAL                       # Process every N frames for performance
     )
 
     # Process stream (set save_output=True to record the stream)
